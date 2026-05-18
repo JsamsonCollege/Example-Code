@@ -1,0 +1,143 @@
+-- Summarize [Anonymized Department] faculty counts by ethnicity, sex, job title, department, and full/part-time status.
+SELECT
+  -- Ethnic group label/code from the deduplicated employee row.
+  AB."Ethnic Group",
+  -- Employee sex from the deduplicated employee row.
+  AB."Sex",
+  -- Full-time or part-time status from the employee row.
+  AB."Full or Part Time",
+  -- Employee job title.
+  AB."Job Title",
+  -- Employee department name.
+  AB."Department Name",
+  -- Count distinct instructors/employees in each grouped bucket.
+  COUNT(DISTINCT AB."BID") AS "BID Count"
+-- Aggregate over the inner faculty/course result set.
+FROM (
+  -- Build one row per instructor with the demographic and job fields needed for the final count.
+  SELECT
+    -- Employee ID used as the counted faculty identifier.
+    C.EMPLID AS "BID",
+    -- Employee sex.
+    C.SEX AS "Sex",
+    -- Employee job title.
+    C.JOBTITLE AS "Job Title",
+    -- Employee department name.
+    C.DEPTNAME "Department Name",
+    -- Employee full-time / part-time status.
+    C.FULL_PART_TIME AS "Full or Part Time",
+    -- Employee ethnic group value.
+    C.ETHNIC_GROUP AS "Ethnic Group"
+  -- Start from class sections and optionally attach academic-org school info.
+  FROM (SYSADM.PS_CLASS_TBL A
+        LEFT OUTER JOIN 
+        -- Pull academic org to school mappings from the academic plan reporting view.
+        (SELECT ACAD_ORG, SCHOOL
+            FROM SYSADM.PS_POM_ACAD_PLN_VW) BA ON A.ACAD_ORG = BA.ACAD_ORG),
+       (
+       -- Deduplicate class instructor rows to one row per section/instructor combination.
+       SELECT CRSE_ID, CRSE_OFFER_NBR, STRM, SESSION_CODE, CLASS_SECTION, EMPLID, CLASS_MTG_NBR
+          FROM (
+            SELECT B.*,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY B.CRSE_ID, B.CRSE_OFFER_NBR, B.STRM,
+                                  B.SESSION_CODE, B.CLASS_SECTION, B.EMPLID
+                     ORDER BY B.EMPLID
+                   ) rn
+              FROM SYSADM.PS_CLASS_INSTR B
+             -- Restrict instructors to term 2257.
+             WHERE B.STRM = '2257'
+          )
+         -- Keep only the first deduplicated instructor row per partition.
+         WHERE rn = 1
+       ) B,
+       (
+       -- Deduplicate employee records to one current active row per employee.
+       SELECT EMPLID, NAME, JOBTITLE, DEPTNAME, ETHNIC_GROUP, SEX, FULL_PART_TIME
+          FROM (
+            SELECT C.*,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY C.EMPLID
+                     ORDER BY C.BUSINESS_TITLE
+                   ) rn
+              FROM SYSADM.PS_EMPLOYEES C
+             WHERE 
+                -- Keep only active employee rows.
+                C.EMPL_STATUS = 'A'
+                -- Keep only the latest effective-dated employee row.
+                AND C.EFFDT = (
+               SELECT MAX(C_ED.EFFDT)
+                 FROM SYSADM.PS_EMPLOYEES C_ED
+                WHERE C.EMPLID = C_ED.EMPLID
+                  AND C_ED.EFFDT <= SYSDATE
+             )
+          )
+         -- Keep one employee row after deduplication.
+         WHERE rn = 1
+       ) C,
+       (
+       -- Deduplicate preferred email rows to one preferred email per employee.
+       SELECT EMPLID, EMAIL_ADDR
+          FROM (
+            SELECT D.*,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY D.EMPLID
+                     ORDER BY D.EMAIL_ADDR
+                   ) rn
+              FROM SYSADM.PS_EMAIL_ADDRESSES D
+             -- Use preferred email addresses only.
+             WHERE D.PREF_EMAIL_FLAG = 'Y'
+          )
+         -- Keep one preferred email row per employee.
+         WHERE rn = 1
+       ) D,
+       -- Course catalog table used to ensure a current effective-dated course row.
+       SYSADM.PS_CRSE_CATALOG E
+  -- Join the class, instructor, employee, email, and catalog tables with report filters.
+  WHERE A.STRM IN ('2257')
+    -- Match the instructor subquery to the same term.
+    AND B.STRM = '2257'
+    -- Keep only active class sections.
+    AND A.CLASS_STAT = 'A'
+    -- Join class rows to class instructor rows.
+    AND B.CRSE_ID = A.CRSE_ID
+    AND B.CRSE_OFFER_NBR = A.CRSE_OFFER_NBR
+    AND B.STRM = A.STRM
+    AND B.SESSION_CODE = A.SESSION_CODE
+    AND B.CLASS_SECTION = A.CLASS_SECTION
+    -- Join instructor rows to employee rows.
+    AND C.EMPLID = B.EMPLID
+    -- Join employee rows to preferred email rows.
+    AND D.EMPLID = C.EMPLID
+    -- Join class rows to the course catalog.
+    AND A.CRSE_ID = E.CRSE_ID
+    -- Exclude session code OU.
+    AND B.SESSION_CODE NOT IN ('OU')
+    -- Restrict to departments with Anonymized Department for PII reasons] in the name.
+    AND C.DEPTNAME LIKE ('%[Anonymized Department for PII reasons]%')
+    -- Keep the primary class meeting number only.
+    AND B.CLASS_MTG_NBR = '1'
+    AND E.EFFDT = (
+      -- Keep the latest effective-dated course catalog row.
+      SELECT MAX(E_ED.EFFDT)
+        FROM SYSADM.PS_CRSE_CATALOG E_ED
+       WHERE E.CRSE_ID = E_ED.CRSE_ID
+         AND E_ED.EFFDT <= SYSDATE
+    )
+  -- Group by the selected employee-level fields to support the outer distinct faculty count.
+  GROUP BY
+     C.EMPLID, C.SEX, C.JOBTITLE, C.DEPTNAME, C.FULL_PART_TIME, C.ETHNIC_GROUP
+) AB
+-- Aggregate by the requested demographic and job dimensions.
+GROUP BY
+  AB."Ethnic Group",
+  AB."Sex",
+  AB."Full or Part Time",
+  AB."Job Title",
+  "Department Name"
+-- Sort the final report by ethnicity, sex, full/part-time, and job title.
+ORDER BY
+  AB."Ethnic Group",
+  AB."Sex",
+  AB."Full or Part Time",
+  AB."Job Title"
