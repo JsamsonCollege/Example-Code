@@ -1,0 +1,234 @@
+-- Return all columns from the final derived query after applying the outer program filter.
+select  * from (
+-- Start a common table expression that isolates one external GPA per student.
+WITH GPA AS (
+    -- Select student IDs and their highest recorded external GPA.
+    SELECT 
+        -- Student identifier used to join GPA back to the admissions records.
+        EMPLID,
+        -- Keep the maximum external GPA found for each student.
+        MAX(EXT_GPA) AS EXT_GPA
+    -- Pull prior-school academic summary rows.
+    FROM SYSADM.PS_EXT_ACAD_SUM
+    -- Ignore rows where the external GPA is blank.
+    WHERE EXT_GPA IS NOT NULL
+    -- Collapse multiple rows down to one GPA value per student.
+    GROUP BY EMPLID
+),
+-- Build the main admissions dataset with student, plan, and prior-school details.
+BASE AS (
+    -- Select distinct rows to reduce duplication caused by the joins below.
+    SELECT DISTINCT
+        -- Student ID from the admissions program table.
+        A.EMPLID, 
+        -- Translate the admit term code into its term description.
+        (SELECT DESCR 
+           -- Use the term table for the human-readable term label.
+           FROM SYSADM.PS_TERM_VAL_TBL 
+          -- Match the term-table row to the student's admit term.
+          WHERE STRM = A.ADMIT_TERM) AS "Admit Term", 
+        -- Convert PeopleSoft program status codes into readable labels.
+        (CASE 
+            -- AC means the student is currently active in the program row.
+            WHEN A.PROG_STATUS = 'AC' THEN 'Active'
+            -- PM means the student is in prematriculation status.
+            WHEN A.PROG_STATUS = 'PM' THEN 'Prematriculation'
+            -- AD means the student has been admitted.
+            WHEN A.PROG_STATUS = 'AD' THEN 'Admitted'
+         END) AS "Program Status",
+        -- Translate the admit type code into its descriptive label.
+        (SELECT DESCR 
+           -- Use the admit type lookup table.
+           FROM SYSADM.PS_ADMIT_TYPE_TBL 
+          -- Match the lookup row to the application's admit type.
+          WHERE ADMIT_TYPE = B.ADMIT_TYPE) AS "Admit Type",
+        -- Name of the last school attended.
+        B1.DESCR50 AS "Previous School",
+        -- Highest external GPA brought in from the GPA CTE.
+        GPA.EXT_GPA AS "Prev School GPA",
+        -- Academic program code from the application program row.
+        A.ACAD_PROG AS "Academic Program",
+        -- Human-readable plan description from the plan view.
+        G.PLANDESCR AS "Plan",
+        -- Academic plan code from the application plan row.
+        '[GENERAL BLOCK]' AS "Plan Code",  
+        -- Flag whether the plan is on the impacted-major list (masked).
+        (CASE WHEN C.ACAD_PLAN IN ('[GENERAL BLOCK]') THEN 'Y' ELSE 'N' END) AS "Impacted Major",
+        (CASE WHEN C1.ACAD_SUB_PLAN IS NULL THEN '-' ELSE C1.ACAD_SUB_PLAN END) AS SUBPLAN,
+        -- Show the subplan description, or a dash when there is no subplan.
+        (SELECT CASE WHEN C1.ACAD_SUB_PLAN IS NOT NULL THEN C2.DESCR ELSE '-' END FROM DUAL) AS SUBPLAN_DESCR, 
+        -- Academic organization code tied to the plan.
+        G.ACAD_ORG AS "Org Code",
+        -- Academic organization description.
+        G.ORGDESCR AS "Org",
+        -- School code associated with the plan.
+        G.SCHOOL AS "School Code",
+        -- School description associated with the plan.
+        G.SCHOOLDESCR AS "School Descr",
+        -- Student last name for display purposes.
+        D.LAST_NAME_SRCH AS "Last Name", 
+        -- Student first name for display purposes.
+        D.FIRST_NAME_SRCH AS "First Name",
+        -- Effective date from the application program row used in the report.
+        A.EFFDT
+    -- Start from the admissions application program table.
+    FROM SYSADM.PS_ADM_APPL_PROG A
+    -- Join the application-level data for admit type and prior-school fields.
+    JOIN SYSADM.PS_ADM_APPL_DATA B
+      -- Match on student ID.
+      ON A.EMPLID = B.EMPLID
+     -- Match on academic career.
+     AND A.ACAD_CAREER = B.ACAD_CAREER
+     -- Match on application number.
+     AND A.ADM_APPL_NBR = B.ADM_APPL_NBR
+    -- Bring in the student's highest external GPA when available.
+    LEFT JOIN GPA
+      -- Join GPA rows by student ID.
+      ON GPA.EMPLID = B.EMPLID
+    -- Join to the external organization table for prior-school description.
+    JOIN SYSADM.PS_EXT_ORG_TBL B1
+      -- Match the prior school attended to its organization row.
+      ON B1.EXT_ORG_ID = B.LAST_SCH_ATTEND
+    -- Join the application plan table to identify the academic plan.
+    JOIN SYSADM.PS_ADM_APPL_PLAN C
+      -- Match the plan row to the same student.
+      ON B.EMPLID = C.EMPLID
+     -- Match the same academic career.
+     AND B.ACAD_CAREER = C.ACAD_CAREER
+     -- Match the same admission application.
+     AND B.ADM_APPL_NBR = C.ADM_APPL_NBR
+    -- Optionally bring in a subplan when one exists for the plan row.
+    LEFT JOIN SYSADM.PS_ADM_APPL_SBPLAN C1
+      -- Match on student ID.
+      ON C.EMPLID = C1.EMPLID 
+     -- Match on academic career.
+     AND C.ACAD_CAREER = C1.ACAD_CAREER 
+     -- Match on application number.
+     AND C.ADM_APPL_NBR = C1.ADM_APPL_NBR 
+     -- Match on application program number.
+     AND C.APPL_PROG_NBR = C1.APPL_PROG_NBR 
+     -- Match on effective-sequence version.
+     AND C.EFFSEQ = C1.EFFSEQ 
+     -- Match on academic plan code.
+     AND C.ACAD_PLAN = C1.ACAD_PLAN
+    -- Optionally join the subplan table to get the subplan description.
+    LEFT JOIN SYSADM.PS_ACAD_SUBPLN_TBL C2
+      -- Match on subplan code.
+      ON C1.ACAD_SUB_PLAN = C2.ACAD_SUB_PLAN 
+     -- Keep only the current effective-dated subplan row.
+     AND C2.EFFDT = (
+            -- Find the latest valid effective date for this plan/subplan pair.
+            SELECT MAX(C2_ED.EFFDT) 
+            -- Search within the academic subplan table.
+            FROM SYSADM.PS_ACAD_SUBPLN_TBL C2_ED 
+            -- Match the same academic plan.
+            WHERE C2.ACAD_PLAN = C2_ED.ACAD_PLAN 
+              -- Match the same academic subplan.
+              AND C2.ACAD_SUB_PLAN = C2_ED.ACAD_SUB_PLAN 
+              -- Only consider rows effective today or earlier.
+              AND C2_ED.EFFDT <= SYSDATE
+      )
+    -- Join personal data to expose student names.
+    JOIN SYSADM.PS_PERSONAL_DATA D
+      -- Match the person row by student ID.
+      ON C.EMPLID = D.EMPLID
+    -- Left join addresses, though no address fields are selected here.
+    LEFT JOIN SYSADM.PS_ADDRESSES K
+      -- Match addresses by student ID.
+      ON D.EMPLID = K.EMPLID
+    -- Join the academic plan reporting view for plan and org descriptions.
+    JOIN SYSADM.PS_POM_ACAD_PLN_VW G
+      -- Match the academic plan code to the reporting view.
+      ON C.ACAD_PLAN = G.ACAD_PLAN
+    -- Apply effective-dated and business-rule filters.
+              -- Match the same admission application number.
+              AND A.ADM_APPL_NBR = A_ED.ADM_APPL_NBR
+              -- Match the same application program number.
+              AND A.APPL_PROG_NBR = A_ED.APPL_PROG_NBR
+              -- Ignore future-dated rows.
+              AND A_ED.EFFDT <= SYSDATE
+      )
+      -- After fixing the effective date, keep the highest sequence for that date.
+      AND A.EFFSEQ = (
+            -- Find the latest effective sequence within the chosen effective date.
+            SELECT MAX(A_ES.EFFSEQ) 
+            -- Search the application program table for matching rows.
+            FROM SYSADM.PS_ADM_APPL_PROG A_ES
+            -- Match the same student.
+            WHERE A.EMPLID = A_ES.EMPLID
+              -- Match the same academic career.
+              AND A.ACAD_CAREER = A_ES.ACAD_CAREER
+              -- Match the same student career number.
+              AND A.STDNT_CAR_NBR = A_ES.STDNT_CAR_NBR
+              -- Match the same admission application.
+              AND A.ADM_APPL_NBR = A_ES.ADM_APPL_NBR
+              -- Match the same application program row.
+              AND A.APPL_PROG_NBR = A_ES.APPL_PROG_NBR
+              -- Limit the search to the already-selected effective date.
+              AND A.EFFDT = A_ES.EFFDT)
+      -- Keep only the current effective-dated prior-school organization row.
+      AND B1.EFFDT = (
+            -- Find the most recent valid effective date for the external organization.
+            SELECT MAX(B1_ED.EFFDT) 
+            -- Search the external organization table.
+            FROM SYSADM.PS_EXT_ORG_TBL B1_ED
+            -- Match the same external organization ID.
+            WHERE B1.EXT_ORG_ID = B1_ED.EXT_ORG_ID
+              -- Ignore future-dated organization rows.
+              AND B1_ED.EFFDT <= SYSDATE)
+      -- Require the prior-school organization row to be active.
+      AND B1.EFF_STATUS = 'A'
+      -- Keep only the latest effective-dated plan row.
+      AND C.EFFDT = (
+            -- Find the maximum effective date for the application plan row.
+            SELECT MAX(C_ED.EFFDT) 
+            -- Search the application plan table again.
+            FROM SYSADM.PS_ADM_APPL_PLAN C_ED
+            -- Match the same student.
+            WHERE C.EMPLID = C_ED.EMPLID
+              -- Match the same academic career.
+              AND C.ACAD_CAREER = C_ED.ACAD_CAREER
+              -- Match the same student career number.
+              AND C.STDNT_CAR_NBR = C_ED.STDNT_CAR_NBR
+              -- Match the same admission application.
+              AND C.ADM_APPL_NBR = C_ED.ADM_APPL_NBR
+              -- Match the same application program row.
+              AND C.APPL_PROG_NBR = C_ED.APPL_PROG_NBR
+              -- Ignore future-dated plan rows.
+              AND C_ED.EFFDT <= SYSDATE)
+      -- After fixing the plan effective date, keep the highest sequence for that date.
+      AND C.EFFSEQ = (
+            -- Find the latest effective sequence for the chosen plan row.
+            SELECT MAX(C_ES.EFFSEQ) 
+            -- Search the application plan table for matching rows.
+            FROM SYSADM.PS_ADM_APPL_PLAN C_ES
+            -- Match the same student.
+            WHERE C.EMPLID = C_ES.EMPLID
+              -- Match the same academic career.
+              AND C.ACAD_CAREER = C_ES.ACAD_CAREER
+              -- Match the same student career number.
+              AND C.STDNT_CAR_NBR = C_ES.STDNT_CAR_NBR
+              -- Match the same admission application.
+              AND C.ADM_APPL_NBR = C_ES.ADM_APPL_NBR
+              -- Match the same application program row.
+              AND C.APPL_PROG_NBR = C_ES.APPL_PROG_NBR
+              -- Limit the search to the already-selected effective date.
+              AND C.EFFDT = C_ES.EFFDT)
+      -- Limit to the three program statuses the report cares about.
+      AND A.PROG_STATUS IN ('AC','PM','AD')
+      -- Restrict to first-time freshman academic level.
+      AND B.ACADEMIC_LEVEL = '10'
+      -- Restrict to admit terms 2247 and later.
+      AND A.ADMIT_TERM >= '2247')
+-- Select from the prepared BASE dataset and calculate major-level average GPA.
+SELECT
+    -- Return all columns assembled in the BASE CTE.
+    BASE.*,
+    -- Calculate the average prior-school GPA within each plan code, rounded to 3 decimals.
+    ROUND(AVG("Prev School GPA") OVER (PARTITION BY "Plan Code"), 3) AS "Avg GPA by Major"
+-- Read from the BASE CTE defined above.
+FROM BASE
+-- Sort primarily by admit term and secondarily by student ID.
+ORDER BY 2, 1
+-- Close the derived table and filter to the undergraduate baccalaureate program.
+ )  WHERE "Academic Program"  = 'UBAC'
