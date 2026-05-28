@@ -21,7 +21,7 @@ FROM (
     -- Employee sex.
     C.SEX AS "Sex",
     -- Employee job title.
-    C.JOBTITLE AS "Job Title",
+    C.[GEN EMPLOYEE LINE] AS "Job Title",
     -- Employee department name.
     C.DEPTNAME "Department Name",
     -- Employee full-time / part-time status.
@@ -53,7 +53,7 @@ FROM (
        ) B,
        (
        -- Deduplicate employee records to one current active row per employee.
-       SELECT EMPLID, NAME, JOBTITLE, DEPTNAME, ETHNIC_GROUP, SEX, FULL_PART_TIME
+       SELECT EMPLID, NAME, [GEN EMPLOYEE LINE], DEPTNAME, ETHNIC_GROUP, SEX, FULL_PART_TIME
           FROM (
             SELECT C.*,
                    ROW_NUMBER() OVER (
@@ -126,7 +126,7 @@ FROM (
     )
   -- Group by the selected employee-level fields to support the outer distinct faculty count.
   GROUP BY
-     C.EMPLID, C.SEX, C.JOBTITLE, C.DEPTNAME, C.FULL_PART_TIME, C.ETHNIC_GROUP
+     C.EMPLID, C.SEX, C.[GEN EMPLOYEE LINE], C.DEPTNAME, C.FULL_PART_TIME, C.ETHNIC_GROUP
 ) AB
 -- Aggregate by the requested demographic and job dimensions.
 GROUP BY
