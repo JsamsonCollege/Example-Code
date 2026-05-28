@@ -1,143 +1,137 @@
--- Summarize [Anonymized Department] faculty counts by ethnicity, sex, job title, department, and full/part-time status.
+-- Return FTES actuals, goal, variance, and enrollment capacity by reporting academic org/subject.
+--
+-- A = aggregated enrollment and FTES by reporting academic group / subject.
+-- G = goal rows from PS_POM_FTES_T_GOAL plus fallback zero-goal rows for active sections.
+--
+-- Notes:
+--   * GE-F cross-listed sections between EWS and another department are attributed to the non-EWS department.
+--   * FTES actuals use 12-unit conversion for graduate/doctoral students and 15-unit conversion for all other students.
+--   * Sections are counted only when class status, enrollment status, and audit/units rules qualify the enrollment.
 SELECT
-  -- Ethnic group label/code from the deduplicated employee row.
-  AB."Ethnic Group",
-  -- Employee sex from the deduplicated employee row.
-  AB."Sex",
-  -- Full-time or part-time status from the employee row.
-  AB."Full or Part Time",
-  -- Employee job title.
-  AB."Job Title",
-  -- Employee department name.
-  AB."Department Name",
-  -- Count distinct instructors/employees in each grouped bucket.
-  COUNT(DISTINCT AB."BID") AS "BID Count"
--- Aggregate over the inner faculty/course result set.
-FROM (
-  -- Build one row per instructor with the demographic and job fields needed for the final count.
-  SELECT
-    -- Employee ID used as the counted faculty identifier.
-    C.EMPLID AS "BID",
-    -- Employee sex.
-    C.SEX AS "Sex",
-    -- Employee job title.
-    C.JOBTITLE AS "Job Title",
-    -- Employee department name.
-    C.DEPTNAME "Department Name",
-    -- Employee full-time / part-time status.
-    C.FULL_PART_TIME AS "Full or Part Time",
-    -- Employee ethnic group value.
-    C.ETHNIC_GROUP AS "Ethnic Group"
-  -- Start from class sections and optionally attach academic-org school info.
-  FROM (SYSADM.PS_CLASS_TBL A
-        LEFT OUTER JOIN 
-        -- Pull academic org to school mappings from the academic plan reporting view.
-        (SELECT ACAD_ORG, SCHOOL
-            FROM SYSADM.PS_POM_ACAD_PLN_VW) BA ON A.ACAD_ORG = BA.ACAD_ORG),
-       (
-       -- Deduplicate class instructor rows to one row per section/instructor combination.
-       SELECT CRSE_ID, CRSE_OFFER_NBR, STRM, SESSION_CODE, CLASS_SECTION, EMPLID, CLASS_MTG_NBR
-          FROM (
-            SELECT B.*,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY B.CRSE_ID, B.CRSE_OFFER_NBR, B.STRM,
-                                  B.SESSION_CODE, B.CLASS_SECTION, B.EMPLID
-                     ORDER BY B.EMPLID
-                   ) rn
-              FROM SYSADM.PS_CLASS_INSTR B
-             -- Restrict instructors to term 2257.
-             WHERE B.STRM = '2257'
-          )
-         -- Keep only the first deduplicated instructor row per partition.
-         WHERE rn = 1
-       ) B,
-       (
-       -- Deduplicate employee records to one current active row per employee.
-       SELECT EMPLID, NAME, JOBTITLE, DEPTNAME, ETHNIC_GROUP, SEX, FULL_PART_TIME
-          FROM (
-            SELECT C.*,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY C.EMPLID
-                     ORDER BY C.BUSINESS_TITLE
-                   ) rn
-              FROM SYSADM.PS_EMPLOYEES C
-             WHERE 
-                -- Keep only active employee rows.
-                C.EMPL_STATUS = 'A'
-                -- Keep only the latest effective-dated employee row.
-                AND C.EFFDT = (
-               SELECT MAX(C_ED.EFFDT)
-                 FROM SYSADM.PS_EMPLOYEES C_ED
-                WHERE C.EMPLID = C_ED.EMPLID
-                  AND C_ED.EFFDT <= SYSDATE
-             )
-          )
-         -- Keep one employee row after deduplication.
-         WHERE rn = 1
-       ) C,
-       (
-       -- Deduplicate preferred email rows to one preferred email per employee.
-       SELECT EMPLID, EMAIL_ADDR
-          FROM (
-            SELECT D.*,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY D.EMPLID
-                     ORDER BY D.EMAIL_ADDR
-                   ) rn
-              FROM SYSADM.PS_EMAIL_ADDRESSES D
-             -- Use preferred email addresses only.
-             WHERE D.PREF_EMAIL_FLAG = 'Y'
-          )
-         -- Keep one preferred email row per employee.
-         WHERE rn = 1
-       ) D,
-       -- Course catalog table used to ensure a current effective-dated course row.
-       SYSADM.PS_CRSE_CATALOG E
-  -- Join the class, instructor, employee, email, and catalog tables with report filters.
-  WHERE A.STRM IN ('2257')
-    -- Match the instructor subquery to the same term.
-    AND B.STRM = '2257'
-    -- Keep only active class sections.
-    AND A.CLASS_STAT = 'A'
-    -- Join class rows to class instructor rows.
-    AND B.CRSE_ID = A.CRSE_ID
-    AND B.CRSE_OFFER_NBR = A.CRSE_OFFER_NBR
-    AND B.STRM = A.STRM
-    AND B.SESSION_CODE = A.SESSION_CODE
-    AND B.CLASS_SECTION = A.CLASS_SECTION
-    -- Join instructor rows to employee rows.
-    AND C.EMPLID = B.EMPLID
-    -- Join employee rows to preferred email rows.
-    AND D.EMPLID = C.EMPLID
-    -- Join class rows to the course catalog.
-    AND A.CRSE_ID = E.CRSE_ID
-    -- Exclude session code OU.
-    AND B.SESSION_CODE NOT IN ('OU')
-    -- Restrict to departments with Anonymized Department for PII reasons] in the name.
-    AND C.DEPTNAME LIKE ('%[Anonymized Department for PII reasons]%')
-    -- Keep the primary class meeting number only.
-    AND B.CLASS_MTG_NBR = '1'
-    AND E.EFFDT = (
-      -- Keep the latest effective-dated course catalog row.
-      SELECT MAX(E_ED.EFFDT)
-        FROM SYSADM.PS_CRSE_CATALOG E_ED
-       WHERE E.CRSE_ID = E_ED.CRSE_ID
-         AND E_ED.EFFDT <= SYSDATE
-    )
-  -- Group by the selected employee-level fields to support the outer distinct faculty count.
-  GROUP BY
-     C.EMPLID, C.SEX, C.JOBTITLE, C.DEPTNAME, C.FULL_PART_TIME, C.ETHNIC_GROUP
-) AB
--- Aggregate by the requested demographic and job dimensions.
+  G.STRM -- term code
+  , ( SELECT SUBSTR(MAX( TO_CHAR(EFFDT,'YYYYMMDD')||ACAD_GROUP ),9) FROM PS_VIEWS.PS_ACAD_GROUP_TBL   WHERE INSTITUTION = 'POCMP' AND ACAD_GROUP = G.ACAD_GROUP AND EFFDT <= SYSDATE ) ACAD_GROUP -- most recent academic group code
+  , ( SELECT SUBSTR(MAX( TO_CHAR(EFFDT,'YYYYMMDD')||DESCR ),9) FROM PS_VIEWS.PS_ACAD_GROUP_TBL   WHERE INSTITUTION = 'POCMP' AND ACAD_GROUP = G.ACAD_GROUP AND EFFDT <= SYSDATE ) COLLEGE -- academic group description
+  , ( SELECT SUBSTR(MAX( TO_CHAR(EFFDT,'YYYYMMDD')||ACAD_ORG ),9) FROM PS_VIEWS.PS_ACAD_ORG_TBL    WHERE INSTITUTION = 'POCMP' AND ACAD_ORG = G.ACAD_ORG     AND EFFDT <= SYSDATE )        ACAD_ORG -- most recent academic org code
+  , ( SELECT SUBSTR(MAX( TO_CHAR(EFFDT,'YYYYMMDD')||DESCR ),9) FROM PS_VIEWS.PS_ACAD_ORG_TBL    WHERE INSTITUTION = 'POCMP' AND ACAD_ORG = G.ACAD_ORG     AND EFFDT <= SYSDATE )        DEPARTMENT -- academic org description
+  , G.SUBJECT SUBJECT -- reporting subject code
+  , COUNT(A.CLASS_NBR)                SECTION_COUNT -- number of sections in the reporting bucket
+  , NVL( TRUNC(SUM(UNITS_FTE_12)/12 + SUM(UNITS_FTE_15)/15,2), 0) FTES_ACTUALS -- actual FTES from enrolled students
+  --, G.TERM_GOAL FTES_GOAL
+   , G.POM_REG_TGHT_FTES  FTES_GOAL -- planned FTES goal from PeopleSoft goal table
+  --, DECODE( G.TERM_GOAL,0,'N/A', NULL,'N/A', TO_CHAR(NVL((TRUNC(SUM(UNITS_FTE_12)/12 + SUM(UNITS_FTE_15)/15,2) - G.TERM_GOAL)/G.TERM_GOAL*100,0),'990.00')||'%' )  FTES_VARIANCE
+  , DECODE( G.POM_REG_TGHT_FTES,0,'N/A', NULL,'N/A', TO_CHAR(NVL((TRUNC(SUM(UNITS_FTE_12)/12 + SUM(UNITS_FTE_15)/15,2) - G.POM_REG_TGHT_FTES)/G.POM_REG_TGHT_FTES*100,0),'990.00')||'%' )  FTES_VARIANCE -- percent variance from the goal or N/A when no goal exists
+  , NVL(SUM(ENRL_CAP), 0) SEATS_OFFERED -- total seats offered across joined sections
+  , NVL(SUM(ENRL_TOT), 0) SEATS_FILLED -- total enrolled seats across joined sections
+  , A.ACAD_YEAR -- academic year aligned with the reporting term
+FROM
+  -- G: goal table rows plus zero-goal fallback for active class buckets with no explicit goal row.
+  ( SELECT STRM, ACAD_GROUP, ACAD_ORG, SUBJECT, POM_REG_TGHT_FTES 
+        FROM PS_VIEWS.PS_POM_FTES_T_GOAL G
+       UNION
+      SELECT STRM, ACAD_GROUP, ACAD_ORG, SUBJECT, 0 FROM PS_VIEWS.PS_CLASS_TBL C
+                   WHERE CLASS_STAT IN ( 'A', 'S', 'T' ) AND CRSE_OFFER_NBR = 1
+                     AND (STRM, ACAD_GROUP, ACAD_ORG, SUBJECT) NOT IN (SELECT STRM, ACAD_GROUP, ACAD_ORG, SUBJECT FROM PS_VIEWS.PS_POM_FTES_T_GOAL G
+                     ) ) G
+  LEFT JOIN
+  -- A: aggregate section-level enrollment and FTES by reporting academic group, org, and subject.
+  ( SELECT
+                    T.STRM
+                    , T.ACAD_YEAR
+                    /* 3. Sections with Course Attribute GE-F that are Cross-Listed between EWS and another department must have ALL calculated FTES from both portions of the cross-listing attributed to the department that is NOT EWS */
+                    , CASE WHEN CATT.CRSE_ATTR = 'GE-F' AND CT.SUBJECT = 'EWS' AND CMBC.SUBJECT <> 'EWS' THEN CMBC.ACAD_GROUP ELSE CT.ACAD_GROUP END RPT_ACAD_GROUP
+                    , CASE WHEN CATT.CRSE_ATTR = 'GE-F' AND CT.SUBJECT = 'EWS' AND CMBC.SUBJECT <> 'EWS' THEN CMBC.ACAD_ORG   ELSE CT.ACAD_ORG END   RPT_ACAD_ORG
+                    , CASE WHEN CATT.CRSE_ATTR = 'GE-F' AND CT.SUBJECT = 'EWS' AND CMBC.SUBJECT <> 'EWS' THEN CMBC.SUBJECT    ELSE CT.SUBJECT END    RPT_SUBJECT
+                    , CASE WHEN CATT.CRSE_ATTR = 'GE-F' AND CT.SUBJECT = 'EWS' AND CMBC.SUBJECT <> 'EWS' THEN CMBC.CLASS_NBR  ELSE CT.CLASS_NBR END  RPT_CLASS_NBR
+                    , CT.SUBJECT
+                    , CT.CLASS_NBR
+                    , MAX(CT.ENRL_CAP)   ENRL_CAP
+                    , MAX(CT.ENRL_TOT)   ENRL_TOT
+        , COUNT(SE.EMPLID)             STDNT_ENRL_COUNT
+        /* 2. FTES Actual in state-supported courses should automatically be state-enrolled students.  Calculation should be based on enrolled students with recognition that 12 units = 1 FTE for Masters and Doctoral students and 15 units = 1 FTE for all other students */
+        , SUM(CASE WHEN DTC.CSU_DEGR_OBJ IN ('5','6','7','8') THEN GREATEST(SE.UNT_TAKEN,SE.UNT_PRGRSS) ELSE 0 END) UNITS_FTE_12
+        , SUM(CASE WHEN DTC.CSU_DEGR_OBJ IN ('5','6','7','8') THEN 0 ELSE GREATEST(SE.UNT_TAKEN,SE.UNT_PRGRSS) END) UNITS_FTE_15
+                FROM
+                   PS_VIEWS.PS_TERM_TBL           T
+                   JOIN PS_VIEWS.PS_CLASS_TBL        CT
+                     ON CT.INSTITUTION = T.INSTITUTION AND CT.ACAD_CAREER = T.ACAD_CAREER AND CT.STRM = T.STRM
+                   LEFT JOIN PS_VIEWS.PS_CLASS_ATTRIBUTE  CATT
+                     ON CATT.CRSE_ID = CT.CRSE_ID AND CATT.CRSE_OFFER_NBR = CT.CRSE_OFFER_NBR AND CATT.STRM = CT.STRM AND CATT.SESSION_CODE = CT.SESSION_CODE AND CATT.CLASS_SECTION = CT.CLASS_SECTION AND CATT.CRSE_ATTR = 'GE-F'
+                   LEFT JOIN PS_VIEWS.PS_SCTN_CMBND       CMB
+                     ON CMB.STRM = CT.STRM AND CMB.CLASS_NBR = CT.CLASS_NBR
+                   LEFT JOIN ( SELECT CMB1.*, CT1.SUBJECT, CT1.CATALOG_NBR, CT1.CLASS_SECTION, CT1.ACAD_GROUP, CT1.ACAD_ORG
+                                FROM  PS_VIEWS.PS_SCTN_CMBND  CMB1
+                                JOIN PS_VIEWS.PS_CLASS_TBL  CT1
+                                  ON CT1.STRM = CMB1.STRM AND CT1.CLASS_NBR = CMB1.CLASS_NBR
+                                WHERE CT1.CLASS_STAT IN ('A','S') AND CT1.CRSE_OFFER_NBR = 1
+                                  AND DECODE(CT1.SUBJECT,'EWS','9','1')||RPAD(CT1.SUBJECT,8)||RPAD(CT1.CATALOG_NBR,10)||RPAD(CT1.CLASS_SECTION,4)||TO_CHAR(CT1.CLASS_NBR,'00000')
+                                       = ( SELECT MIN( DECODE(Z_CT.SUBJECT,'EWS','9','1')||RPAD(Z_CT.SUBJECT,8)||RPAD(Z_CT.CATALOG_NBR,10)||RPAD(Z_CT.CLASS_SECTION,4)||TO_CHAR(Z_CT.CLASS_NBR,'00000') )
+                                            FROM PS_VIEWS.PS_SCTN_CMBND  Z_CMB
+                                            JOIN PS_VIEWS.PS_CLASS_TBL  Z_CT
+                                              ON Z_CT.STRM = Z_CMB.STRM AND Z_CT.CLASS_NBR = Z_CMB.CLASS_NBR
+                                            WHERE Z_CMB.INSTITUTION = CMB1.INSTITUTION AND Z_CMB.STRM = CMB1.STRM AND Z_CMB.SESSION_CODE = CMB1.SESSION_CODE AND Z_CMB.SCTN_COMBINED_ID = CMB1.SCTN_COMBINED_ID
+                                              AND Z_CT.CLASS_STAT IN ('A','S') AND Z_CT.CRSE_OFFER_NBR = 1 )
+                              ) CMBC
+                     ON CMBC.INSTITUTION = CMB.INSTITUTION AND CMBC.STRM = CMB.STRM AND CMBC.SESSION_CODE = CMB.SESSION_CODE AND CMBC.SCTN_COMBINED_ID = CMB.SCTN_COMBINED_ID
+                   LEFT JOIN PS_VIEWS.PS_STDNT_ENRL      SE
+                     ON SE.STRM = CT.STRM AND SE.CLASS_NBR = CT.CLASS_NBR AND SE.STDNT_ENRL_STATUS = 'E'
+                    AND SE.SESSION_CODE NOT LIKE 'OU%' AND SE.AUDIT_GRADE_BASIS = 'N' AND SE.UNITS_ATTEMPTED IN ('I', 'Y')
+                   LEFT JOIN PS_VIEWS.PS_STDNT_CAR_TERM  ST
+                     ON ST.EMPLID = SE.EMPLID AND ST.ACAD_CAREER = SE.ACAD_CAREER AND ST.STRM = SE.STRM
+                   LEFT JOIN PS_VIEWS.PS_ACAD_PROG  PR
+                     ON PR.EMPLID = ST.EMPLID AND PR.ACAD_CAREER = ST.ACAD_CAREER AND PR.STDNT_CAR_NBR = ST.STDNT_CAR_NBR AND PR.EFFDT <= T.SSR_TRMAC_LAST_DT
+                    AND ( PR.ROWID IS NULL
+                          OR
+                          ( PR.EFFDT  = ( SELECT MAX(EFFDT)  FROM PS_VIEWS.PS_ACAD_PROG  WHERE EMPLID = PR.EMPLID AND ACAD_CAREER = PR.ACAD_CAREER AND STDNT_CAR_NBR = PR.STDNT_CAR_NBR AND EFFDT <= T.SSR_TRMAC_LAST_DT )
+                            AND PR.EFFSEQ = ( SELECT MAX(EFFSEQ) FROM PS_VIEWS.PS_ACAD_PROG  WHERE EMPLID = PR.EMPLID AND ACAD_CAREER = PR.ACAD_CAREER AND STDNT_CAR_NBR = PR.STDNT_CAR_NBR AND EFFDT = PR.EFFDT ) )
+                        )
+                   LEFT JOIN PS_VIEWS.PS_ACAD_PLAN  PL
+                     ON PL.EMPLID = PR.EMPLID AND PL.ACAD_CAREER = PR.ACAD_CAREER AND PL.STDNT_CAR_NBR = PR.STDNT_CAR_NBR AND PL.EFFDT = PR.EFFDT AND PL.EFFSEQ = PR.EFFSEQ
+                    AND ( PL.ROWID IS NULL
+                          OR
+                          TO_CHAR(PL.PLAN_SEQUENCE,'0000')||PL.ACAD_PLAN
+                           = ( SELECT MAX( TO_CHAR(PLAN_SEQUENCE,'0000')||ACAD_PLAN ) FROM PS_VIEWS.PS_ACAD_PLAN  WHERE EMPLID = PR.EMPLID AND ACAD_CAREER = PR.ACAD_CAREER AND STDNT_CAR_NBR = PR.STDNT_CAR_NBR AND EFFDT = PR.EFFDT AND EFFSEQ = PR.EFFSEQ ) )
+                   LEFT JOIN PS_VIEWS.PS_ACAD_PLAN_TBL  PLT
+                     ON PLT.INSTITUTION = PR.INSTITUTION AND PLT.ACAD_PLAN = PL.ACAD_PLAN AND PLT.EFFDT <= T.TERM_BEGIN_DT
+                    AND ( PLT.ROWID IS NULL
+                          OR
+                          PLT.EFFDT = ( SELECT MAX(EFFDT) FROM PS_VIEWS.PS_ACAD_PLAN_TBL  WHERE INSTITUTION = PR.INSTITUTION AND ACAD_PLAN = PL.ACAD_PLAN AND EFFDT <= T.TERM_BEGIN_DT ) )
+                   LEFT JOIN PS_VIEWS.PS_DEGREE_TBL  DT
+                     ON DT.DEGREE = PLT.DEGREE AND DT.EFFDT <= T.TERM_BEGIN_DT
+                    AND ( DT.ROWID IS NULL
+                          OR DT.EFFDT = ( SELECT MAX(EFFDT) FROM PS_VIEWS.PS_DEGREE_TBL  WHERE DEGREE = DT.DEGREE AND EFFDT <= T.TERM_BEGIN_DT ) )
+                   LEFT JOIN PS_VIEWS.PS_CSU_DEGREE_SBR  DTC
+                     ON DTC.DEGREE = DT.DEGREE AND DTC.EFFDT = DT.EFFDT
+                WHERE 
+                  T.STRM >= 2187
+                   AND 1=1
+                  AND T.INSTITUTION = 'POCMP'
+                  AND CT.CLASS_STAT IN ( 'A', 'S', 'T' )
+                  AND CT.CRSE_OFFER_NBR = 1
+                  AND ( SE.ROWID IS NULL
+                        OR
+                      EXISTS( SELECT 'X' FROM PS_VIEWS.PS_CLASS_TBL CT1
+                               JOIN PS_VIEWS.PS_CLASS_ATTRIBUTE CA1
+                                 ON CA1.CRSE_ID = CT1.CRSE_ID AND CA1.STRM = CT1.STRM AND CA1.CRSE_OFFER_NBR = CT1.CRSE_OFFER_NBR AND CA1.SESSION_CODE = CT1.SESSION_CODE AND CA1.CLASS_SECTION = CT1.CLASS_SECTION
+                               WHERE CT1.STRM = SE.STRM AND CT1.CLASS_NBR = SE.CLASS_NBR
+                                 AND CA1.CRSE_ATTR = 'CLEV'
+                                 AND CA1.CRSE_ATTR_VALUE IN ('1','2','3')
+                                 AND ( (PR.ACAD_PROG = 'GEXTD' AND CA1.CRSE_ATTR_VALUE IN ('1')) OR (PR.ACAD_PROG <> 'GEXTD' AND CA1.CRSE_ATTR_VALUE IN ('1','2','3')) ) )
+                    )
+    GROUP BY
+       T.STRM, CMBC.ACAD_GROUP, CMBC.ACAD_ORG, CMBC.SUBJECT, CMBC.CLASS_NBR, CT.ACAD_GROUP, CT.ACAD_ORG, CT.SUBJECT, CT.CLASS_NBR, CATT.CRSE_ATTR, T.ACAD_YEAR
+   ) A
+    ON A.STRM = G.STRM AND A.RPT_ACAD_GROUP = G.ACAD_GROUP AND A.RPT_ACAD_ORG = G.ACAD_ORG AND A.RPT_SUBJECT = G.SUBJECT
+WHERE
+  -- G.STRM = &P_STRM
+  G.STRM>='2187'
+  -- G.STRM='2247'
+  -- AND ( TRIM(A.RPT_SUBJECT) IS NOT NULL OR NVL(G.POM_REG_TGHT_FTES,0) > 0 ) ALLOWS NULL VALUES
 GROUP BY
-  AB."Ethnic Group",
-  AB."Sex",
-  AB."Full or Part Time",
-  AB."Job Title",
-  "Department Name"
--- Sort the final report by ethnicity, sex, full/part-time, and job title.
-ORDER BY
-  AB."Ethnic Group",
-  AB."Sex",
-  AB."Full or Part Time",
-  AB."Job Title"
+  G.STRM
+  , G.ACAD_GROUP
+  , G.ACAD_ORG
+  , G.SUBJECT
+  --, G.TERM_GOAL
+  , G.POM_REG_TGHT_FTES,
+  A.ACAD_YEAR
+ORDER BY 1,2,3,5,4
